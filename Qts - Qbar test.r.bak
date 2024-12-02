@@ -1,0 +1,75 @@
+# Required Libraries
+library(rmgarch)  # For DCC-GARCH modeling
+library(MASS)     # For pseudo-inverse (ginv)
+
+# Step 1: GARCH(1,1) Estimation Function
+estimate_garch11 <- function(data) {
+  garch_fit <- garchFit(~ garch(1, 1), data = data, trace = FALSE)
+  params <- c(mu = coef(garch_fit)["mu"], 
+              alpha = coef(garch_fit)["alpha1"], 
+              beta = coef(garch_fit)["beta1"])
+  return(params)
+}
+
+# Step 2: GARCH(1,1) Conditional Variance Calculation
+garch11_fit <- function(data, mu, alpha, beta) {
+  T <- length(data)
+  sigma2 <- numeric(T)
+  sigma2[1] <- var(data)
+  
+  for (t in 2:T) {
+    sigma2[t] <- alpha * (data[t-1] - mu)^2 + beta * sigma2[t-1]
+  }
+  
+  return(sigma2)
+}
+
+# Step 3: DCC-GARCH estimation function
+dcc_garch <- function(data) {
+  # Define the GARCH model for each series
+  spec <- dccspec(uspec = multispec(replicate(ncol(data), 
+    garchSpec(model = list(variance.model = list(model = "sGARCH", 
+    garchOrder = c(1, 1)), mean.model = list(armaOrder = c(0, 0)))))), 
+    dccOrder = c(1, 1), distribution = "mvnorm")
+  
+  fit <- dccfit(spec, data)
+  return(fit)
+}
+
+# Step 4: Calculate Frobenius norm of differences between Q_t and Q_bar
+calculate_frobenius_norm <- function(fit, qbar) {
+  # Extract the conditional covariance matrices Q_t
+  Q_t <- fit@mfit$Q
+  
+  # Calculate the Frobenius norm of the difference between each Q_t and Q_bar
+  frobenius_norms <- numeric(dim(Q_t)[3])  # Create a vector to store norms
+  for (t in 1:dim(Q_t)[3]) {
+    frobenius_norms[t] <- norm(Q_t[,,t] - qbar, type = "F")
+  }
+  
+  return(frobenius_norms)
+}
+
+# Step 5: Main function to simulate data and perform DCC-GARCH estimation
+simulate_and_analyze <- function(n_assets, n_obs, qbar) {
+  # Simulate multivariate normal returns
+  set.seed(123)  # For reproducibility
+  data <- matrix(rnorm(n_assets * n_obs), nrow = n_obs, ncol = n_assets)
+  
+  # Fit the DCC-GARCH model
+  fit <- dcc_garch(data)
+  
+  # Calculate Frobenius norms
+  frobenius_norms <- calculate_frobenius_norm(fit, qbar)
+  
+  return(frobenius_norms)
+}
+
+# Usage: Set parameters for simulation
+n_assets <- 3  # Number of assets
+n_obs <- 500   # Number of observations
+qbar <- diag(1, n_assets)  # Example: Identity matrix for Q_bar
+
+# Run simulation and analyze results
+frobenius_norms <- simulate_and_analyze(n_assets, n_obs, qbar)
+print(frobenius_norms)

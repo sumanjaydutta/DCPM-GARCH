@@ -1,0 +1,119 @@
+# Load necessary packages
+library(rugarch)
+
+# Step 1: Fit GARCH(1,1) model to each time series
+fit_garch <- function(returns) {
+  spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                     mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+                     distribution.model = "norm")
+  garch_fit <- ugarchfit(spec = spec, data = returns)
+  
+  sigma2 <- sigma(garch_fit)^2  # Conditional variance
+  residuals <- residuals(garch_fit, standardize = TRUE)  # Standardized residuals
+  
+  return(list(sigma2 = sigma2, residuals = residuals))
+}
+
+# Step 2: DCC-GARCH Model
+
+# Function to compute DCC log-likelihood and return time-varying Qt matrices
+dcc_garch_log_likelihood <- function(params, residuals) {
+  a <- params[1]
+  b <- params[2]
+  
+  T <- nrow(residuals)
+  N <- ncol(residuals)
+  
+  Q_bar <- cov(residuals)  # Unconditional covariance matrix of residuals
+  Qt <- Q_bar
+  Qt_list <- list()  # List to store Qt matrices over time
+  
+  log_likelihood <- 0
+  
+  for (t in 2:T) {
+    Qt <- (1 - a - b) * Q_bar + a * (residuals[t-1, ] %*% t(residuals[t-1, ])) + b * Qt
+    Rt <- diag(1 / sqrt(diag(Qt))) %*% Qt %*% diag(1 / sqrt(diag(Qt)))  # Dynamic correlation matrix
+    
+    log_likelihood <- log_likelihood + log(det(Rt)) + t(residuals[t, ]) %*% solve(Rt) %*% residuals[t, ]
+    
+    Qt_list[[t]] <- Qt  # Store Qt for averaging later
+  }
+  
+  return(list(log_likelihood = log_likelihood, Qt_list = Qt_list))
+}
+
+# Fit DCC model to residuals
+fit_dcc_garch <- function(residuals) {
+  initial_params <- c(0.05, 0.9)  # Initial guesses for DCC parameters
+  result <- optim(initial_params, function(params) dcc_garch_log_likelihood(params, residuals)$log_likelihood,
+                  method = "L-BFGS-B", lower = c(1e-6, 1e-6), upper = c(1, 1))
+  
+  # Return both the parameters and the list of Qt matrices
+  Qt_result <- dcc_garch_log_likelihood(result$par, residuals)
+  
+  return(list(params = result$par, Qt_list = Qt_result$Qt_list))
+}
+
+# Function to compute the time-average of the Qt matrices
+average_Qt <- function(Qt_list) {
+  T <- length(Qt_list)
+  Qt_sum <- Qt_list[[2]]  # Initialize with the first Qt
+  
+  for (t in 3:T) {
+    Qt_sum <- Qt_sum + Qt_list[[t]]
+  }
+  
+  Qt_avg <- Qt_sum / (T - 1)  # Time-average (excluding the first value)
+  return(Qt_avg)
+}
+
+# Function to compute Frobenius norm of the difference between matrices
+frobenius_norm <- function(A, B) {
+  return(norm(A - B, type = "F"))
+}
+
+# Full DCC-GARCH model
+dcc_garch <- function(returns_matrix) {
+  N <- ncol(returns_matrix)  # Number of time series
+  T <- nrow(returns_matrix)
+  
+  residuals_matrix <- matrix(0, T, N)
+  
+  # Step 1: Fit univariate GARCH models and get standardized residuals
+  for (i in 1:N) {
+    garch_result <- fit_garch(returns_matrix[, i])
+    residuals_matrix[, i] <- garch_result$residuals
+  }
+  
+  # Step 2: Fit DCC model to standardized residuals
+  dcc_result <- fit_dcc_garch(residuals_matrix)
+  
+  # Calculate time-averaged Qt
+  Qt_avg <- average_Qt(dcc_result$Qt_list)
+  
+  # Compare Qt_avg with Q_bar (unconditional covariance matrix)
+  Q_bar <- cov(residuals_matrix)
+  
+  # Compute Frobenius norm of the difference
+  frob_norm_diff <- frobenius_norm(Qt_avg, Q_bar)
+  
+  return(list(dcc_params = dcc_result$params, Qt_avg = Qt_avg, Q_bar = Q_bar, frob_norm_diff = frob_norm_diff))
+}
+
+# Example usage
+set.seed(42)
+T <- 1000  # Number of observations
+N <- 50    # Number of time series
+
+# Generate synthetic data
+returns_matrix <- matrix(rnorm(T * N), ncol = N)
+
+# Fit the DCC-GARCH model
+dcc_result <- dcc_garch(returns_matrix)
+
+# Print the results
+print("Estimated DCC parameters:")
+print(dcc_result$dcc_params)
+
+print("Frobenius norm of the difference between time-averaged Qt and Q_bar:")
+print(dcc_result$frob_norm_diff)

@@ -1,0 +1,94 @@
+# Load Required Libraries
+library(mvtnorm)  # For multivariate normal simulations
+library(rugarch)  # For GARCH model
+library(xdcclarge) # For CDCC estimation
+library(dplyr)    # For data manipulation
+
+# Step 1: Simulate Synthetic Data
+set.seed(123)
+n <- 3  # Number of assets
+T <- 500  # Number of observations
+
+# Generate correlated returns
+mu <- rep(0, n)
+Sigma <- matrix(c(1, 0.5, 0.5,
+                  0.5, 1, 0.3,
+                  0.5, 0.3, 1), n, n)  # Example covariance matrix
+
+# Simulate correlated returns
+returns <- rmvnorm(T, mean = mu, sigma = Sigma)
+
+# Calculate log returns
+Rtn <- log(returns[-1,] / returns[-T,])
+
+# Step 2: GARCH Parameter Estimation with rugarch
+spec = ugarchspec()
+mspec = multispec(replicate(spec, n = n))
+fitlist = multifit(multispec = mspec, data = Rtn)
+
+# Check for residuals and conditional variances
+ht <- sigma(fitlist)^2  # Conditional variances
+residuals <- residuals(fitlist)  # Standardized residuals
+
+# Step 3: Calculate Out-of-Sample Metrics
+calculate_metrics <- function(estimated_cov, returns) {
+  # Portfolio weights (equal weights for simplicity)
+  weights <- rep(1/n, n)
+  
+  # Portfolio standard deviation
+  portfolio_std <- sqrt(t(weights) %*% estimated_cov %*% weights)
+  
+  # Out-of-sample returns (last T - 1 observations)
+  out_of_sample_returns <- rowSums(returns[-1,]) / n
+  annualized_return <- mean(out_of_sample_returns) * 252  # Assuming 252 trading days
+  
+  # Information ratio
+  info_ratio <- annualized_return / portfolio_std
+  
+  return(list(portfolio_std = portfolio_std, 
+              annualized_return = annualized_return, 
+              info_ratio = info_ratio))
+}
+
+# Step 4: Calculate Metrics for Different Methods
+methods <- c("COV", "LS", "NLS")
+metrics_results <- data.frame(Method = character(), 
+                               Portfolio_Std = numeric(), 
+                               Annualized_Return = numeric(), 
+                               Information_Ratio = numeric(), 
+                               stringsAsFactors = FALSE)
+
+for (method in methods) {
+  cat("\nRunning CDCC estimation for method:", method, "\n")
+  
+  # CDCC Estimation using the xdcc package
+  cDCC <- cdcc_estimation(ini.para = c(0.05, 0.93), ht = ht, residuals = residuals, method = method)
+  
+  # Check if the conditional covariance is returned correctly
+  if (is.null(cDCC$cdcc_Cov)) {
+    cat("Warning: cdcc_Cov is NULL for method", method, ". Continuing to next method.\n")
+    next
+  }
+  
+  # Extract the conditional covariance matrix at the final time step
+  estimated_cov <- cDCC$cdcc_Cov[, , T]
+  
+  # Calculate out-of-sample metrics
+  metrics <- calculate_metrics(estimated_cov, returns)
+  
+  # Store the metrics in the results data frame
+  metrics_results <- metrics_results %>% 
+    add_row(Method = method, 
+            Portfolio_Std = metrics$portfolio_std, 
+            Annualized_Return = metrics$annualized_return, 
+            Information_Ratio = metrics$info_ratio)
+  
+  # Print the metrics for this method
+  cat("Portfolio Standard Deviation for method", method, ":", metrics$portfolio_std, "\n")
+  cat("Annualized Return for method", method, ":", metrics$annualized_return, "\n")
+  cat("Information Ratio for method", method, ":", metrics$info_ratio, "\n")
+}
+
+# Output the metrics results in a table
+cat("\nFinal Metrics Results:\n")
+print(metrics_results)

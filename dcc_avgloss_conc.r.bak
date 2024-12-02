@@ -1,0 +1,181 @@
+# Load Required Libraries
+library(mvtnorm)   # For multivariate normal simulations
+library(glasso)    # For graphical lasso
+library(xts)       # For time series handling
+library(dplyr)     # For data manipulation
+
+# Regularize the covariance matrix to avoid singularity
+regularize_cov <- function(cov_matrix, epsilon = 1e-6) {
+  diag(cov_matrix) <- diag(cov_matrix) + epsilon
+  return(cov_matrix)
+}
+
+# Step 1: Univariate GARCH(1,1) estimation
+garch11_fit <- function(y, omega, alpha, beta) {
+  T <- length(y)
+  sigma2 <- rep(0, T)
+  sigma2[1] <- var(y)
+  
+  for (t in 2:T) {
+    sigma2[t] <- omega + alpha * y[t-1]^2 + beta * sigma2[t-1]
+  }
+  
+  return(sigma2)
+}
+
+# Step 2: Estimate GARCH parameters for each asset using numerical optimization
+estimate_garch11 <- function(y) {
+  start_params <- c(omega = 0.1, alpha = 0.1, beta = 0.8)
+  optim_result <- optim(start_params, function(params) {
+    omega <- params[1]
+    alpha <- params[2]
+    beta  <- params[3]
+    
+    sigma2 <- garch11_fit(y, omega, alpha, beta)
+    
+    # Return negative log-likelihood
+    -sum(dnorm(y, mean = 0, sd = sqrt(sigma2), log = TRUE))
+  }, y = y, method = "L-BFGS-B", lower = c(1e-6, 1e-6, 1e-6), upper = c(1, 1, 1))
+  
+  return(optim_result$par)
+}
+
+# Step 3: Estimate the inverse covariance matrix using Graphical Lasso (Glasso)
+estimate_inverse_covariance <- function(e) {
+  glasso_fit <- glasso(cor(e), rho = 0.1)  # You may need to tune rho
+  return(glasso_fit$wi)  # Inverse covariance matrix
+}
+
+# Step 4: Dynamic Conditional Correlation (DCC) update function
+dcc_update <- function(e, qbar_inv, a, b) {
+  T <- nrow(e)
+  k <- ncol(e)
+  
+  Qt_inv <- array(0, dim = c(k, k, T))
+  Rt <- array(0, dim = c(k, k, T))
+  Qt_inv[,,1] <- qbar_inv
+  
+  for (t in 2:T) {
+    e_t_minus_1 <- matrix(e[t-1, ], nrow = 1)
+    diff_cov <- t(e_t_minus_1) %*% e_t_minus_1
+    
+    Qt_inv[,,t] <- (1 - a - b) * qbar_inv + a * diff_cov + b * Qt_inv[,,t-1]
+    
+    # Check if Qt_inv is positive definite
+    if (any(eigen(Qt_inv[,,t])$values <= 0)) {
+      Qt_inv[,,t] <- qbar_inv  # Revert to qbar_inv if not positive definite
+      warning("Qt_inv is not positive definite. Using qbar_inv instead.")
+    }
+    
+    Rt[,,t] <- diag(1 / sqrt(diag(solve(Qt_inv[,,t])))) %*% solve(Qt_inv[,,t]) %*% diag(1 / sqrt(diag(solve(Qt_inv[,,t]))))
+  }
+  
+  return(Rt)
+}
+
+# Step 5: DCC-GARCH estimation function (adapted version with conditional covariance)
+dcc_garch <- function(data) {
+  # Estimate DCC parameters
+  start_params <- c(a = 0.01, b = 0.95)
+  
+  # Define the objective function to minimize (negative log-likelihood)
+  objective_fn <- function(params) {
+    a <- params[1]
+    b <- params[2]
+    
+    garch_params <- t(apply(data, 2, estimate_garch11))
+    sigma2 <- matrix(0, nrow(data), ncol(data))
+    e <- matrix(0, nrow(data), ncol(data))
+    
+    for (i in 1:ncol(data)) {
+      params <- garch_params[i, ]
+      sigma2[,i] <- garch11_fit(data[,i], params[1], params[2], params[3])
+      e[,i] <- data[,i] / sqrt(sigma2[,i])
+    }
+    
+    qbar_inv <- estimate_inverse_covariance(e)
+    Rt <- dcc_update(e, qbar_inv, a, b)
+    
+    # Compute log-likelihood (negative to minimize)
+    return(-sum(dnorm(e, mean = 0, sd = sqrt(sigma2), log = TRUE)))
+  }
+  
+  optim_result <- optim(start_params, objective_fn, method = "L-BFGS-B", lower = c(0, 0), upper = c(1, 1))
+  
+  dcc_params <- optim_result$par
+  garch_params <- t(apply(data, 2, estimate_garch11))
+  
+  sigma2 <- matrix(0, nrow(data), ncol(data))
+  e <- matrix(0, nrow(data), ncol(data))
+  
+  for (i in 1:ncol(data)) {
+    params <- garch_params[i, ]
+    sigma2[,i] <- garch11_fit(data[,i], params[1], params[2], params[3])
+    e[,i] <- data[,i] / sqrt(sigma2[,i])
+  }
+  
+  qbar_inv <- estimate_inverse_covariance(e)
+  Rt <- dcc_update(e, qbar_inv, dcc_params[1], dcc_params[2])
+  
+  # Calculate the conditional covariance matrix
+  conditional_cov <- array(0, dim = c(ncol(data), ncol(data), nrow(data)))
+  for (t in 1:nrow(data)) {
+    conditional_cov[,,t] <- diag(sqrt(sigma2[t,])) %*% Rt[,,t] %*% diag(sqrt(sigma2[t,]))
+  }
+  
+  return(list(sigma2 = sigma2, correlation = Rt, conditional_cov = conditional_cov, dcc_params = dcc_params))
+}
+
+# Step 6: Comparison of DCC-GARCH with XDCC methods and their Average Losses
+average_loss <- function(estimated_cov, true_cov, mean_returns) {
+  loss_cov <- norm(estimated_cov - true_cov, type = "F")^2
+  loss_return <- sum((mean_returns)^2)
+  return(loss_cov + loss_return)
+}
+
+xdcc_methods <- function(returns) {
+  # Placeholder functions for COV, LS, NLS methods from the XDCC package
+  COV <- list(conditional_cov = cov(returns))  # Replace with actual XDCC COV function
+  LS <- list(conditional_cov = cov(returns))   # Replace with actual XDCC LS function
+  NLS <- list(conditional_cov = cov(returns))  # Replace with actual XDCC NLS function
+  
+  return(list(COV = COV, LS = LS, NLS = NLS))
+}
+
+# Run the Experiment with Sample Sizes from 50 to 1000
+set.seed(123)
+n_stocks <- 500
+sample_sizes <- seq(50, 1000, by = 50)
+loss_results <- data.frame(Sample_Size = integer(), DCC_Loss = numeric(), COV_Loss = numeric(), LS_Loss = numeric(), NLS_Loss = numeric())
+
+for (sample_size in sample_sizes) {
+  cat("\nRunning DCC-GARCH and XDCC estimation for sample size:", sample_size, "\n")
+  
+  T <- 500
+  mu <- rep(0, n_stocks)
+  Sigma <- matrix(0.5, n_stocks, n_stocks)
+  diag(Sigma) <- 1
+  
+  returns <- rmvnorm(T, mean = mu, sigma = Sigma)[1:T, 1:sample_size]
+  
+  ### DCC-GARCH Method ###
+  dcc_result <- dcc_garch(returns)
+  true_cov <- Sigma[1:sample_size, 1:sample_size]
+  mean_returns <- colMeans(returns)
+  dcc_loss <- average_loss(dcc_result$conditional_cov[,,T], true_cov, mean_returns)
+  
+  ### XDCC Methods ###
+  xdcc_metrics <- xdcc_methods(returns)
+  cov_loss <- average_loss(xdcc_metrics$COV$conditional_cov, true_cov, mean_returns)
+  ls_loss  <- average_loss(xdcc_metrics$LS$conditional_cov, true_cov, mean_returns)
+  nls_loss <- average_loss(xdcc_metrics$NLS$conditional_cov, true_cov, mean_returns)
+  
+  ### Store Results ###
+  loss_results <- rbind(loss_results, data.frame(Sample_Size = sample_size, 
+                                                 DCC_Loss = dcc_loss, 
+                                                 COV_Loss = cov_loss, 
+                                                 LS_Loss = ls_loss, 
+                                                 NLS_Loss = nls_loss))
+  
+  ### Print Loss ###
+  cat("DCC Loss:", dcc_loss, "COV Loss:",
